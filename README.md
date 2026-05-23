@@ -57,6 +57,9 @@ Recording file opened: /app/recordings/recording_20260523_121500.mp4
 Status: recording
 ```
 
+When a publisher stops streaming, the container keeps running and waits for the
+next publisher. It does not exit after one live session.
+
 ## Run With Docker Compose
 
 ```bash

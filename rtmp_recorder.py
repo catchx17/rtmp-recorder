@@ -440,9 +440,14 @@ def main(argv: list[str]) -> int:
             return 0
 
         if exit_code == 0:
-            log("ffmpeg exited normally.")
-            stop_nginx(NGINX_PROCESS)
-            return 0
+            if args.duration:
+                log("ffmpeg exited normally after the configured duration.")
+                stop_nginx(NGINX_PROCESS)
+                return 0
+            retries = 0
+            log(f"Stream ended; waiting for the next publisher in {args.reconnect_delay}s.")
+            time.sleep(args.reconnect_delay)
+            continue
 
         retries += 1
         if args.max_retries >= 0 and retries > args.max_retries:
