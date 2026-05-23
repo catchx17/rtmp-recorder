@@ -36,7 +36,13 @@ docker run --rm -it `
 
 ```powershell
 cd C:\Users\masterke\Desktop\rtmp-recorder
-$env:PUBLIC_HOST="192.168.110.83"
+docker compose up -d
+```
+
+如果希望日志里直接显示公网推流地址，可以在启动前设置：
+
+```powershell
+$env:PUBLIC_HOST="你的服务器公网IP或域名"
 docker compose up -d
 ```
 
