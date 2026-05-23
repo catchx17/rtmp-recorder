@@ -301,6 +301,7 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
         last_status_at = 0.0
         last_file: Path | None = None
         last_size: int | None = None
+        last_growth_at = started_at
         process = subprocess.Popen(
             command,
             stdout=ffmpeg_log,
@@ -328,6 +329,8 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
                             delta = size
                         else:
                             delta = max(0, size - last_size)
+                        if delta > 0:
+                            last_growth_at = now
                         last_size = size
                         log(
                             "Status: recording, "
@@ -337,6 +340,14 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
                     else:
                         log(f"Status: waiting for stream, elapsed={elapsed}s")
                     last_status_at = now
+
+                if current_file and args.idle_timeout and now - last_growth_at > args.idle_timeout:
+                    log(
+                        f"No recording data for {args.idle_timeout}s; restarting ffmpeg "
+                        "to wait for the next publisher."
+                    )
+                    stop_ffmpeg(process)
+                    return 124
 
                 if args.wait_timeout and now - started_at > args.wait_timeout and current_file is None:
                     log(f"No stream arrived within {args.wait_timeout}s; stopping this attempt.")
@@ -380,6 +391,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=-1, help="max retries after failure; -1 retries forever")
     parser.add_argument("--reconnect-delay", type=positive_int, default=5, help="seconds before retry")
     parser.add_argument("--status-interval", type=positive_int, default=10, help="status log interval in seconds")
+    parser.add_argument("--idle-timeout", type=positive_int, default=30, help="restart ffmpeg after this many seconds without recorded data")
     parser.add_argument("--log-dir", default="logs", help="ffmpeg log directory, default: logs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable path")
     parser.add_argument("--start-nginx", action="store_true", help="start nginx-rtmp before recording")
