@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 SHOULD_STOP = False
+NGINX_PROCESS: subprocess.Popen[bytes] | None = None
 
 
 def log(message: str, *, stderr: bool = False) -> None:
@@ -36,7 +37,7 @@ def configure_output() -> None:
 def request_stop(signum: int, _frame: object) -> None:
     global SHOULD_STOP
     SHOULD_STOP = True
-    log(f"Received signal {signum}; stopping ffmpeg and finalizing the current file.")
+    log(f"Received signal {signum}; stopping recorder and finalizing the current file.")
 
 
 def positive_int(value: str) -> int:
@@ -138,6 +139,10 @@ def rtmp_public_url(host: str, port: int, app: str, stream_key: str) -> str:
     return f"rtmp://{host}:{port}/{app.strip('/')}/{stream_key.strip('/')}"
 
 
+def rtmp_pull_url(args: argparse.Namespace) -> str:
+    return f"rtmp://{args.pull_host}:{args.pull_port}/{args.app.strip('/')}/{args.stream_key.strip('/')}"
+
+
 def build_segment_output(out_dir: Path, prefix: str, ext: str) -> str:
     return str(out_dir / f"{prefix}_%Y%m%d_%H%M%S.{ext}")
 
@@ -147,15 +152,13 @@ def build_single_output(out_dir: Path, prefix: str, ext: str) -> str:
 
 
 def ffmpeg_command(args: argparse.Namespace, output_path: str) -> list[str]:
-    input_url = rtmp_listen_url(args.bind, args.port, args.app, args.stream_key)
+    input_url = rtmp_pull_url(args)
     command = [
         args.ffmpeg,
         "-hide_banner",
         "-nostdin",
         "-loglevel",
         args.loglevel,
-        "-listen",
-        "1",
         "-i",
         input_url,
         "-map",
@@ -208,6 +211,42 @@ def stop_ffmpeg(process: subprocess.Popen[bytes]) -> None:
     process.kill()
 
 
+def start_nginx(args: argparse.Namespace) -> subprocess.Popen[bytes] | None:
+    if not args.start_nginx:
+        return None
+
+    if shutil.which(args.nginx) is None and not Path(args.nginx).exists():
+        log("nginx was not found. Install nginx with the RTMP module or disable --start-nginx.", stderr=True)
+        raise SystemExit(2)
+
+    command = [args.nginx, "-g", "daemon off;"]
+    if args.nginx_conf:
+        command.extend(["-c", args.nginx_conf])
+
+    log("Starting nginx-rtmp server.")
+    log("Command: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+    process = subprocess.Popen(command)
+    time.sleep(1)
+    if process.poll() is not None:
+        log(f"nginx exited early with code {display_exit_code(process.returncode)}.", stderr=True)
+        raise SystemExit(process.returncode or 1)
+    log(f"nginx started with PID {process.pid}.")
+    return process
+
+
+def stop_nginx(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    log("Stopping nginx.")
+    try:
+        process.terminate()
+        process.wait(timeout=10)
+        return
+    except Exception:
+        pass
+    process.kill()
+
+
 def recent_output_file(out_dir: Path, prefix: str, ext: str, started_at: float) -> Path | None:
     candidates: list[Path] = []
     for candidate in out_dir.glob(f"{prefix}_*.{ext}"):
@@ -249,10 +288,10 @@ def print_push_addresses(args: argparse.Namespace) -> None:
 def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
     command = ffmpeg_command(args, output_path)
     output_dir = Path(args.output).resolve()
-    log("Starting RTMP recorder.")
+    log("Starting stream recorder.")
     log("Command: " + " ".join(f'"{part}"' if " " in part else part for part in command))
     log(f"ffmpeg log file: {log_file}")
-    log("Waiting for an RTMP publisher to connect...")
+    log(f"Waiting for stream from nginx-rtmp: {rtmp_pull_url(args)}")
 
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     with log_file.open("ab") as ffmpeg_log:
@@ -300,7 +339,7 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
                     last_status_at = now
 
                 if args.wait_timeout and now - started_at > args.wait_timeout and current_file is None:
-                    log(f"No RTMP stream arrived within {args.wait_timeout}s; stopping this attempt.")
+                    log(f"No stream arrived within {args.wait_timeout}s; stopping this attempt.")
                     stop_ffmpeg(process)
                     return 124
 
@@ -314,7 +353,7 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Listen for an RTMP push stream and record it with ffmpeg."
+        description="Record an RTMP push stream. In Docker, nginx-rtmp receives the stream and ffmpeg records it."
     )
     parser.add_argument("--bind", default="0.0.0.0", help="listen address, default: 0.0.0.0")
     parser.add_argument(
@@ -323,6 +362,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="host/IP shown to publishers; set this to your server public IP in Docker",
     )
     parser.add_argument("--port", type=positive_int, default=1935, help="RTMP port, default: 1935")
+    parser.add_argument("--pull-host", default="127.0.0.1", help="RTMP source host for ffmpeg, default: 127.0.0.1")
+    parser.add_argument("--pull-port", type=positive_int, default=1935, help="RTMP source port for ffmpeg, default: 1935")
     parser.add_argument("--app", default="live", help="RTMP app path, default: live")
     parser.add_argument("--stream-key", default="stream", help="stream key, default: stream")
     parser.add_argument("-o", "--output", default="recordings", help="output directory, default: recordings")
@@ -341,6 +382,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--status-interval", type=positive_int, default=10, help="status log interval in seconds")
     parser.add_argument("--log-dir", default="logs", help="ffmpeg log directory, default: logs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable path")
+    parser.add_argument("--start-nginx", action="store_true", help="start nginx-rtmp before recording")
+    parser.add_argument("--nginx", default="nginx", help="nginx executable path")
+    parser.add_argument("--nginx-conf", default="", help="nginx config path")
     parser.add_argument(
         "--loglevel",
         default="warning",
@@ -355,6 +399,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    global NGINX_PROCESS
     configure_output()
     signal.signal(signal.SIGINT, request_stop)
     if hasattr(signal, "SIGTERM"):
@@ -364,6 +409,8 @@ def main(argv: list[str]) -> int:
     if shutil.which(args.ffmpeg) is None and not Path(args.ffmpeg).exists():
         log("ffmpeg was not found. Install ffmpeg or set --ffmpeg.", stderr=True)
         return 2
+
+    NGINX_PROCESS = start_nginx(args)
 
     output_dir = Path(args.output).resolve()
     log_dir = Path(args.log_dir).resolve()
@@ -389,10 +436,12 @@ def main(argv: list[str]) -> int:
 
         if SHOULD_STOP:
             log("Recorder stopped.")
+            stop_nginx(NGINX_PROCESS)
             return 0
 
         if exit_code == 0:
             log("ffmpeg exited normally.")
+            stop_nginx(NGINX_PROCESS)
             return 0
 
         retries += 1
@@ -401,6 +450,7 @@ def main(argv: list[str]) -> int:
                 f"ffmpeg exited with code {display_exit_code(exit_code)}; max retries reached.",
                 stderr=True,
             )
+            stop_nginx(NGINX_PROCESS)
             return exit_code
 
         log(
@@ -409,6 +459,7 @@ def main(argv: list[str]) -> int:
         )
         time.sleep(args.reconnect_delay)
 
+    stop_nginx(NGINX_PROCESS)
     return 0
 
 
