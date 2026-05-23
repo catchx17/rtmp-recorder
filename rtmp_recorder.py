@@ -389,7 +389,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--duration", type=positive_int, help="total recording seconds after stream starts")
     parser.add_argument("--wait-timeout", type=non_negative_int, default=0, help="stream wait timeout; 0 waits forever")
     parser.add_argument("--max-retries", type=int, default=-1, help="max retries after failure; -1 retries forever")
-    parser.add_argument("--reconnect-delay", type=positive_int, default=5, help="seconds before retry")
+    parser.add_argument("--reconnect-delay", type=non_negative_int, default=0, help="seconds before retry, default: 0")
     parser.add_argument("--status-interval", type=positive_int, default=10, help="status log interval in seconds")
     parser.add_argument("--idle-timeout", type=positive_int, default=30, help="restart ffmpeg after this many seconds without recorded data")
     parser.add_argument("--log-dir", default="logs", help="ffmpeg log directory, default: logs")
