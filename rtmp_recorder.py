@@ -14,6 +14,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -141,6 +144,58 @@ def rtmp_public_url(host: str, port: int, app: str, stream_key: str) -> str:
 
 def rtmp_pull_url(args: argparse.Namespace) -> str:
     return f"rtmp://{args.pull_host}:{args.pull_port}/{args.app.strip('/')}/{args.stream_key.strip('/')}"
+
+
+def stream_is_published(args: argparse.Namespace) -> bool:
+    if not args.stat_url:
+        return True
+
+    try:
+        with urllib.request.urlopen(args.stat_url, timeout=2) as response:
+            payload = response.read()
+    except (OSError, urllib.error.URLError):
+        return False
+
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return False
+
+    app_name = args.app.strip("/")
+    stream_key = args.stream_key.strip("/")
+    for application in root.iter("application"):
+        name = application.findtext("name")
+        if name != app_name:
+            continue
+        for stream in application.iter("stream"):
+            if stream.findtext("name") == stream_key:
+                return True
+    return False
+
+
+def wait_for_publisher(args: argparse.Namespace) -> bool:
+    if not args.stat_url:
+        return True
+
+    log(f"Waiting for publisher: app={args.app.strip('/')}, stream-key={args.stream_key.strip('/')}")
+    started_at = time.time()
+    last_status_at = 0.0
+    while not SHOULD_STOP:
+        if stream_is_published(args):
+            log("Publisher detected; starting recorder.")
+            return True
+
+        now = time.time()
+        if now - last_status_at >= args.status_interval:
+            log(f"Status: waiting for publisher, elapsed={int(now - started_at)}s")
+            last_status_at = now
+
+        if args.wait_timeout and now - started_at > args.wait_timeout:
+            log(f"No publisher arrived within {args.wait_timeout}s; stopping this attempt.")
+            return False
+
+        time.sleep(args.publish_poll_interval)
+    return False
 
 
 def build_segment_output(out_dir: Path, prefix: str, ext: str) -> str:
@@ -286,6 +341,9 @@ def print_push_addresses(args: argparse.Namespace) -> None:
 
 
 def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
+    if not wait_for_publisher(args):
+        return 124
+
     command = ffmpeg_command(args, output_path)
     output_dir = Path(args.output).resolve()
     log("Starting stream recorder.")
@@ -398,6 +456,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--nginx", default="nginx", help="nginx executable path")
     parser.add_argument("--nginx-conf", default="", help="nginx config path")
     parser.add_argument(
+        "--stat-url",
+        default=os.environ.get("RTMP_STAT_URL", ""),
+        help="nginx-rtmp stat URL used to detect publishers; set empty to disable",
+    )
+    parser.add_argument(
+        "--publish-poll-interval",
+        type=positive_int,
+        default=1,
+        help="seconds between publisher checks, default: 1",
+    )
+    parser.add_argument(
         "--loglevel",
         default="warning",
         choices=["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug"],
@@ -418,6 +487,8 @@ def main(argv: list[str]) -> int:
         signal.signal(signal.SIGTERM, request_stop)
 
     args = parse_args(argv)
+    if args.start_nginx and not args.stat_url:
+        args.stat_url = "http://127.0.0.1:8080/stat"
     if shutil.which(args.ffmpeg) is None and not Path(args.ffmpeg).exists():
         log("ffmpeg was not found. Install ffmpeg or set --ffmpeg.", stderr=True)
         return 2
