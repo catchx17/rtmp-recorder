@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import http.server
 import ipaddress
 import os
 import re
@@ -13,15 +14,15 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
-import urllib.error
-import urllib.request
-import xml.etree.ElementTree as ET
+import urllib.parse
 from pathlib import Path
 
 
 SHOULD_STOP = False
 NGINX_PROCESS: subprocess.Popen[bytes] | None = None
+DEFAULT_TRIGGER_CONF = "/tmp/rtmp-recorder-notify.conf"
 
 
 def log(message: str, *, stderr: bool = False) -> None:
@@ -55,6 +56,13 @@ def non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be greater than or equal to 0")
     return parsed
+
+
+def nginx_conf_token(value: object) -> str:
+    token = str(value)
+    if not token or re.search(r"[\s;{}]", token):
+        raise ValueError(f"nginx config value is not safe to write unquoted: {token!r}")
+    return token
 
 
 def timestamp() -> str:
@@ -134,10 +142,6 @@ def local_ipv4_addresses() -> list[str]:
     return sorted(set(usable), key=sort_key)
 
 
-def rtmp_listen_url(bind_host: str, port: int, app: str, stream_key: str) -> str:
-    return f"rtmp://{bind_host}:{port}/{app.strip('/')}/{stream_key.strip('/')}"
-
-
 def rtmp_public_url(host: str, port: int, app: str, stream_key: str) -> str:
     return f"rtmp://{host}:{port}/{app.strip('/')}/{stream_key.strip('/')}"
 
@@ -146,64 +150,19 @@ def rtmp_pull_url(args: argparse.Namespace) -> str:
     return f"rtmp://{args.pull_host}:{args.pull_port}/{args.app.strip('/')}/{args.stream_key.strip('/')}"
 
 
-def stream_is_published(args: argparse.Namespace) -> bool:
-    if not args.stat_url:
-        return True
-
-    try:
-        with urllib.request.urlopen(args.stat_url, timeout=2) as response:
-            payload = response.read()
-    except (OSError, urllib.error.URLError):
-        return False
-
-    try:
-        root = ET.fromstring(payload)
-    except ET.ParseError:
-        return False
-
-    app_name = args.app.strip("/")
-    stream_key = args.stream_key.strip("/")
-    for application in root.iter("application"):
-        name = application.findtext("name")
-        if name != app_name:
-            continue
-        for stream in application.iter("stream"):
-            if stream.findtext("name") == stream_key:
-                return True
-    return False
-
-
-def wait_for_publisher(args: argparse.Namespace) -> bool:
-    if not args.stat_url:
-        return True
-
-    log(f"Waiting for publisher: app={args.app.strip('/')}, stream-key={args.stream_key.strip('/')}")
-    started_at = time.time()
-    last_status_at = 0.0
-    while not SHOULD_STOP:
-        if stream_is_published(args):
-            log("Publisher detected; starting recorder.")
-            return True
-
-        now = time.time()
-        if now - last_status_at >= args.status_interval:
-            log(f"Status: waiting for publisher, elapsed={int(now - started_at)}s")
-            last_status_at = now
-
-        if args.wait_timeout and now - started_at > args.wait_timeout:
-            log(f"No publisher arrived within {args.wait_timeout}s; stopping this attempt.")
-            return False
-
-        time.sleep(args.publish_poll_interval)
-    return False
+def session_args(base_args: argparse.Namespace, app: str, stream_key: str) -> argparse.Namespace:
+    args = argparse.Namespace(**vars(base_args))
+    args.app = app
+    args.stream_key = stream_key
+    return args
 
 
 def build_segment_output(out_dir: Path, prefix: str, ext: str) -> str:
     return str(out_dir / f"{prefix}_%Y%m%d_%H%M%S.{ext}")
 
 
-def build_single_output(out_dir: Path, prefix: str, ext: str) -> str:
-    return str(out_dir / f"{prefix}_{timestamp()}.{ext}")
+def build_single_output(out_dir: Path, prefix: str, ext: str, name_timestamp: str) -> str:
+    return str(out_dir / f"{prefix}_{name_timestamp}.{ext}")
 
 
 def ffmpeg_command(args: argparse.Namespace, output_path: str) -> list[str]:
@@ -211,20 +170,18 @@ def ffmpeg_command(args: argparse.Namespace, output_path: str) -> list[str]:
     command = [
         args.ffmpeg,
         "-hide_banner",
-        "-nostdin",
         "-loglevel",
         args.loglevel,
-        "-i",
-        input_url,
-        "-map",
-        "0",
-        "-c",
-        "copy",
     ]
+
+    if args.read_timeout:
+        command.extend(["-rw_timeout", str(args.read_timeout * 1_000_000)])
+    command.extend(["-i", input_url, "-map", "0", "-c", "copy"])
 
     if args.duration:
         command.extend(["-t", str(args.duration)])
 
+    mp4_movflags = "+frag_keyframe+empty_moov+default_base_moof"
     if args.segment_time:
         command.extend(
             [
@@ -236,10 +193,14 @@ def ffmpeg_command(args: argparse.Namespace, output_path: str) -> list[str]:
                 "1",
                 "-strftime",
                 "1",
-                output_path,
             ]
         )
+        if args.ext == "mp4":
+            command.extend(["-segment_format_options", f"movflags={mp4_movflags}", "-flush_packets", "1"])
+        command.append(output_path)
     else:
+        if args.ext == "mp4":
+            command.extend(["-movflags", mp4_movflags, "-flush_packets", "1"])
         command.extend(["-y", output_path])
 
     return command
@@ -248,6 +209,16 @@ def ffmpeg_command(args: argparse.Namespace, output_path: str) -> list[str]:
 def stop_ffmpeg(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
+
+    try:
+        if process.stdin is not None:
+            process.stdin.write(b"q")
+            process.stdin.flush()
+            process.stdin.close()
+            process.wait(timeout=15)
+            return
+    except Exception:
+        pass
 
     try:
         process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
@@ -264,6 +235,25 @@ def stop_ffmpeg(process: subprocess.Popen[bytes]) -> None:
         pass
 
     process.kill()
+
+
+def write_nginx_trigger_config(args: argparse.Namespace) -> None:
+    config_path = Path(args.nginx_trigger_conf)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    publish_url = f"http://{args.notify_host}:{args.notify_port}/on_publish"
+    publish_done_url = f"http://{args.notify_host}:{args.notify_port}/on_publish_done"
+    lines = [
+        "notify_method get;",
+        "on_publish " + nginx_conf_token(publish_url) + ";",
+        "on_publish_done " + nginx_conf_token(publish_done_url) + ";",
+    ]
+    config_path.write_text(
+        "# Generated by rtmp_recorder.py. Do not edit inside the running container.\n"
+        + "\n".join(lines)
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def start_nginx(args: argparse.Namespace) -> subprocess.Popen[bytes] | None:
@@ -302,29 +292,6 @@ def stop_nginx(process: subprocess.Popen[bytes] | None) -> None:
     process.kill()
 
 
-def recent_output_file(out_dir: Path, prefix: str, ext: str, started_at: float) -> Path | None:
-    candidates: list[Path] = []
-    for candidate in out_dir.glob(f"{prefix}_*.{ext}"):
-        try:
-            if candidate.stat().st_mtime >= started_at - 1:
-                candidates.append(candidate)
-        except OSError:
-            continue
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def format_size(size: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024
-    return f"{size} B"
-
-
 def print_push_addresses(args: argparse.Namespace) -> None:
     ips = [args.public_host] if args.public_host else local_ipv4_addresses()
     log("Use one of these RTMP addresses in your camera, phone app, OBS, or encoder:")
@@ -340,91 +307,188 @@ def print_push_addresses(args: argparse.Namespace) -> None:
     log("The pushing device must be able to reach this host and TCP port.")
 
 
-def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
-    if not wait_for_publisher(args):
-        return 124
+class RecorderSession:
+    def __init__(
+        self,
+        key: tuple[str, str],
+        process: subprocess.Popen[bytes],
+        log_file: Path,
+        ffmpeg_log: object,
+    ) -> None:
+        self.key = key
+        self.process = process
+        self.log_file = log_file
+        self.ffmpeg_log = ffmpeg_log
+        self.stopping = False
 
-    command = ffmpeg_command(args, output_path)
-    output_dir = Path(args.output).resolve()
-    log("Starting stream recorder.")
-    log("Command: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    log(f"ffmpeg log file: {log_file}")
-    log(f"Waiting for stream from nginx-rtmp: {rtmp_pull_url(args)}")
+    def close_log(self) -> None:
+        try:
+            self.ffmpeg_log.close()
+        except Exception:
+            pass
 
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    with log_file.open("ab") as ffmpeg_log:
+
+class RecorderManager:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.lock = threading.Lock()
+        self.sessions: dict[tuple[str, str], RecorderSession] = {}
+
+    def start(self, app: str, stream_key: str) -> None:
+        key = (app.strip("/"), stream_key.strip("/"))
+        if not key[0] or not key[1]:
+            raise ValueError("missing RTMP app or stream name")
+
+        with self.lock:
+            existing = self.sessions.get(key)
+        if existing and existing.process.poll() is None:
+            log(f"Replacing active recorder for app={key[0]}, stream-key={key[1]}.")
+            self.stop(key)
+
+        args = session_args(self.args, key[0], key[1])
+        output_dir = Path(args.output).resolve()
+        log_dir = Path(args.log_dir).resolve()
+        recording_timestamp = timestamp()
+        output_path = (
+            build_segment_output(output_dir, args.prefix, args.ext)
+            if args.segment_time
+            else build_single_output(output_dir, args.prefix, args.ext, recording_timestamp)
+        )
+        log_file = log_dir / f"{args.prefix}_rtmp_{recording_timestamp}.log"
+        command = ffmpeg_command(args, output_path)
+
+        log(f"Publisher callback: app={key[0]}, stream-key={key[1]}; starting recorder.")
+        log("Command: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+        log(f"ffmpeg log file: {log_file}")
+
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        ffmpeg_log = log_file.open("ab")
         ffmpeg_log.write(("\n\n=== start " + dt.datetime.now().isoformat(timespec="seconds") + " ===\n").encode())
         ffmpeg_log.flush()
-        started_at = time.time()
-        last_status_at = 0.0
-        last_file: Path | None = None
-        last_size: int | None = None
-        last_growth_at = started_at
-        process = subprocess.Popen(
-            command,
-            stdout=ffmpeg_log,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-        )
-        log(f"ffmpeg started with PID {process.pid}.")
         try:
-            while process.poll() is None:
-                now = time.time()
-                if SHOULD_STOP:
-                    stop_ffmpeg(process)
-                    break
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=ffmpeg_log,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
+        except Exception:
+            ffmpeg_log.close()
+            raise
 
-                current_file = recent_output_file(output_dir, args.prefix, args.ext, started_at)
-                if current_file and current_file != last_file:
-                    last_file = current_file
-                    log(f"Recording file opened: {current_file}")
+        session = RecorderSession(key, process, log_file, ffmpeg_log)
+        with self.lock:
+            self.sessions[key] = session
 
-                if now - last_status_at >= args.status_interval:
-                    elapsed = int(now - started_at)
-                    if current_file and current_file.exists():
-                        size = current_file.stat().st_size
-                        if last_size is None:
-                            delta = size
-                        else:
-                            delta = max(0, size - last_size)
-                        if delta > 0:
-                            last_growth_at = now
-                        last_size = size
-                        log(
-                            "Status: recording, "
-                            f"elapsed={elapsed}s, file={current_file.name}, "
-                            f"size={format_size(size)}, delta={format_size(delta)}"
-                        )
-                    else:
-                        log(f"Status: waiting for stream, elapsed={elapsed}s")
-                    last_status_at = now
+        threading.Thread(target=self._watch, args=(session,), daemon=True).start()
 
-                if current_file and args.idle_timeout and now - last_growth_at > args.idle_timeout:
-                    log(
-                        f"No recording data for {args.idle_timeout}s; restarting ffmpeg "
-                        "to wait for the next publisher."
-                    )
-                    stop_ffmpeg(process)
-                    return 124
+    def stop(self, key: tuple[str, str]) -> None:
+        with self.lock:
+            session = self.sessions.get(key)
+        if not session or session.process.poll() is not None or session.stopping:
+            return
 
-                if args.wait_timeout and now - started_at > args.wait_timeout and current_file is None:
-                    log(f"No stream arrived within {args.wait_timeout}s; stopping this attempt.")
-                    stop_ffmpeg(process)
-                    return 124
+        session.stopping = True
+        log(f"Publisher finished: app={key[0]}, stream-key={key[1]}; stopping recorder.")
+        threading.Thread(target=self._stop_process, args=(session,), daemon=True).start()
 
-                time.sleep(0.5)
-        finally:
-            if SHOULD_STOP:
-                stop_ffmpeg(process)
+    def stop_all(self) -> None:
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            if session.process.poll() is None:
+                session.stopping = True
+                stop_ffmpeg(session.process)
+        for session in sessions:
+            session.close_log()
 
-        return process.wait()
+    def _stop_process(self, session: RecorderSession) -> None:
+        stop_ffmpeg(session.process)
+
+    def _watch(self, session: RecorderSession) -> None:
+        exit_code = session.process.wait()
+        session.close_log()
+        with self.lock:
+            if self.sessions.get(session.key) is session:
+                del self.sessions[session.key]
+        if exit_code == 0:
+            log(f"Recorder finished: app={session.key[0]}, stream-key={session.key[1]}.")
+        else:
+            log(
+                "Recorder exited with code "
+                f"{display_exit_code(exit_code)}: app={session.key[0]}, stream-key={session.key[1]}.",
+                stderr=True,
+            )
+
+
+class NotifyHandler(http.server.BaseHTTPRequestHandler):
+    server: "NotifyServer"
+
+    def do_GET(self) -> None:
+        self._handle()
+
+    def do_POST(self) -> None:
+        self._handle()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def _handle(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if self.command == "POST":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            post_params = urllib.parse.parse_qs(body, keep_blank_values=True)
+            params.update(post_params)
+
+        app = params.get("app", [""])[0]
+        stream_key = params.get("name", [""])[0]
+        try:
+            if parsed.path == "/on_publish":
+                self.server.manager.start(app, stream_key)
+                if self.server.manager.args.notify_start_delay:
+                    time.sleep(self.server.manager.args.notify_start_delay)
+            elif parsed.path == "/on_publish_done":
+                key = (app.strip("/"), stream_key.strip("/"))
+                self.server.manager.stop(key)
+            else:
+                self._respond(404, "not found\n")
+                return
+        except Exception as exc:
+            log(f"Notify callback failed: {exc}", stderr=True)
+            self._respond(500, "error\n")
+            return
+
+        self._respond(200, "ok\n")
+
+    def _respond(self, status: int, body: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class NotifyServer(http.server.ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], manager: RecorderManager) -> None:
+        super().__init__(server_address, NotifyHandler)
+        self.manager = manager
+
+
+def start_notify_server(args: argparse.Namespace, manager: RecorderManager) -> NotifyServer:
+    server = NotifyServer((args.notify_host, args.notify_port), manager)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"Started RTMP notify callback server on {args.notify_host}:{args.notify_port}.")
+    return server
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record an RTMP push stream. In Docker, nginx-rtmp receives the stream and ffmpeg records it."
     )
-    parser.add_argument("--bind", default="0.0.0.0", help="listen address, default: 0.0.0.0")
     parser.add_argument(
         "--public-host",
         default=os.environ.get("PUBLIC_HOST", ""),
@@ -445,26 +509,38 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="segment length in seconds, default: 600; set to 0 for a single file",
     )
     parser.add_argument("--duration", type=positive_int, help="total recording seconds after stream starts")
-    parser.add_argument("--wait-timeout", type=non_negative_int, default=0, help="stream wait timeout; 0 waits forever")
-    parser.add_argument("--max-retries", type=int, default=-1, help="max retries after failure; -1 retries forever")
-    parser.add_argument("--reconnect-delay", type=non_negative_int, default=0, help="seconds before retry, default: 0")
-    parser.add_argument("--status-interval", type=positive_int, default=10, help="status log interval in seconds")
-    parser.add_argument("--idle-timeout", type=positive_int, default=30, help="restart ffmpeg after this many seconds without recorded data")
+    parser.add_argument(
+        "--read-timeout",
+        type=non_negative_int,
+        default=5,
+        help="ffmpeg RTMP read timeout in seconds; 0 disables",
+    )
     parser.add_argument("--log-dir", default="logs", help="ffmpeg log directory, default: logs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable path")
     parser.add_argument("--start-nginx", action="store_true", help="start nginx-rtmp before recording")
     parser.add_argument("--nginx", default="nginx", help="nginx executable path")
     parser.add_argument("--nginx-conf", default="", help="nginx config path")
     parser.add_argument(
-        "--stat-url",
-        default=os.environ.get("RTMP_STAT_URL", ""),
-        help="nginx-rtmp stat URL used to detect publishers; set empty to disable",
+        "--nginx-trigger-conf",
+        default=os.environ.get("NGINX_TRIGGER_CONF", DEFAULT_TRIGGER_CONF),
+        help=f"nginx include file written for trigger mode, default: {DEFAULT_TRIGGER_CONF}",
     )
     parser.add_argument(
-        "--publish-poll-interval",
+        "--notify-host",
+        default=os.environ.get("RTMP_NOTIFY_HOST", "127.0.0.1"),
+        help="host for nginx-rtmp publish callbacks, default: 127.0.0.1",
+    )
+    parser.add_argument(
+        "--notify-port",
         type=positive_int,
-        default=1,
-        help="seconds between publisher checks, default: 1",
+        default=int(os.environ.get("RTMP_NOTIFY_PORT", "8080")),
+        help="port for nginx-rtmp publish callbacks, default: 8080",
+    )
+    parser.add_argument(
+        "--notify-start-delay",
+        type=non_negative_int,
+        default=int(os.environ.get("RTMP_NOTIFY_START_DELAY", "1")),
+        help="seconds to hold the publish callback after starting ffmpeg, default: 1",
     )
     parser.add_argument(
         "--loglevel",
@@ -487,13 +563,13 @@ def main(argv: list[str]) -> int:
         signal.signal(signal.SIGTERM, request_stop)
 
     args = parse_args(argv)
-    if args.start_nginx and not args.stat_url:
-        args.stat_url = "http://127.0.0.1:8080/stat"
+    if not args.start_nginx:
+        log("nginx trigger recording requires --start-nginx.", stderr=True)
+        return 2
+
     if shutil.which(args.ffmpeg) is None and not Path(args.ffmpeg).exists():
         log("ffmpeg was not found. Install ffmpeg or set --ffmpeg.", stderr=True)
         return 2
-
-    NGINX_PROCESS = start_nginx(args)
 
     output_dir = Path(args.output).resolve()
     log_dir = Path(args.log_dir).resolve()
@@ -502,53 +578,38 @@ def main(argv: list[str]) -> int:
     args.output = str(output_dir)
     args.log_dir = str(log_dir)
 
+    try:
+        write_nginx_trigger_config(args)
+    except ValueError as exc:
+        log(str(exc), stderr=True)
+        return 2
+
+    manager = RecorderManager(args)
+    try:
+        notify_server = start_notify_server(args, manager)
+    except OSError as exc:
+        log(f"Could not start RTMP notify callback server: {exc}", stderr=True)
+        return 2
+
+    NGINX_PROCESS = start_nginx(args)
+
     print_push_addresses(args)
     log(f"Output directory: {output_dir}")
     log(f"ffmpeg log directory: {log_dir}")
-    log("Press Ctrl+C to stop and finalize the current recording.")
-
-    retries = 0
-    while not SHOULD_STOP:
-        output_path = (
-            build_segment_output(output_dir, args.prefix, args.ext)
-            if args.segment_time
-            else build_single_output(output_dir, args.prefix, args.ext)
-        )
-        log_file = log_dir / f"{args.prefix}_rtmp_{timestamp()}.log"
-        exit_code = run_once(args, output_path, log_file)
-
-        if SHOULD_STOP:
-            log("Recorder stopped.")
-            stop_nginx(NGINX_PROCESS)
-            return 0
-
-        if exit_code == 0:
-            if args.duration:
-                log("ffmpeg exited normally after the configured duration.")
-                stop_nginx(NGINX_PROCESS)
-                return 0
-            retries = 0
-            log(f"Stream ended; waiting for the next publisher in {args.reconnect_delay}s.")
-            time.sleep(args.reconnect_delay)
-            continue
-
-        retries += 1
-        if args.max_retries >= 0 and retries > args.max_retries:
-            log(
-                f"ffmpeg exited with code {display_exit_code(exit_code)}; max retries reached.",
-                stderr=True,
-            )
-            stop_nginx(NGINX_PROCESS)
-            return exit_code
-
-        log(
-            f"ffmpeg exited with code {display_exit_code(exit_code)}; "
-            f"retrying in {args.reconnect_delay}s (attempt {retries})."
-        )
-        time.sleep(args.reconnect_delay)
-
-    stop_nginx(NGINX_PROCESS)
-    return 0
+    log("Record mode: trigger; nginx on_publish starts ffmpeg when a publisher connects.")
+    log("Press Ctrl+C to stop nginx and the recorder service.")
+    try:
+        while not SHOULD_STOP:
+            if NGINX_PROCESS is not None and NGINX_PROCESS.poll() is not None:
+                log(f"nginx exited with code {display_exit_code(NGINX_PROCESS.returncode)}.", stderr=True)
+                return NGINX_PROCESS.returncode or 1
+            time.sleep(1)
+        return 0
+    finally:
+        stop_nginx(NGINX_PROCESS)
+        manager.stop_all()
+        notify_server.shutdown()
+        notify_server.server_close()
 
 
 if __name__ == "__main__":

@@ -43,22 +43,27 @@ docker run -d \
   ghcr.io/catchx17/rtmp-recorder:latest
 ```
 
-View logs:
+View service logs:
 
 ```bash
 docker logs -f rtmp-recorder
 ```
 
-The container logs should show status lines like:
+The service log should show nginx started and trigger mode enabled:
 
 ```text
-Status: waiting for stream
-Recording file opened: /app/recordings/recording_20260523_121500.mp4
-Status: recording
+nginx started with PID 7.
+Record mode: trigger; nginx on_publish starts ffmpeg when a publisher connects.
 ```
 
 When a publisher stops streaming, the container keeps running and waits for the
 next publisher. It does not exit after one live session.
+
+Recording is started by nginx-rtmp `on_publish`, so there is no stats-polling
+loop waiting for publishers.
+
+The bundled nginx config uses a single worker so the incoming RTMP publisher and
+the local ffmpeg recorder always see the same live stream state.
 
 ## Run With Docker Compose
 
@@ -82,11 +87,16 @@ ffmpeg logs are written to:
 logs/
 ```
 
+Each pushed RTMP session gets its own ffmpeg log file.
+
 Default filename format:
 
 ```text
 recording_YYYYMMDD_HHMMSS.mp4
 ```
+
+MP4 outputs are written as fragmented MP4 so interrupted RTMP sessions still
+leave usable data on disk.
 
 Default segment length is 10 minutes:
 
@@ -118,6 +128,12 @@ Record a single file:
 
 ```bash
 docker run ... ghcr.io/catchx17/rtmp-recorder:latest --segment-time 0
+```
+
+Change RTMP read timeout after a publisher disconnects:
+
+```bash
+docker run ... ghcr.io/catchx17/rtmp-recorder:latest --read-timeout 5
 ```
 
 Change filename prefix:

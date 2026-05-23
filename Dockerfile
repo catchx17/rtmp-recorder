@@ -15,10 +15,10 @@ WORKDIR /app
 COPY rtmp_recorder.py /app/rtmp_recorder.py
 COPY nginx.conf /etc/nginx/nginx.conf
 
-RUN mkdir -p /app/recordings /app/logs
+RUN mkdir -p /app/recordings /app/logs \
+    && touch /tmp/rtmp-recorder-notify.conf
 
 EXPOSE 1935
-EXPOSE 8080
 
 ENTRYPOINT ["python", "-u", "/app/rtmp_recorder.py"]
 CMD ["--start-nginx", "--nginx-conf", "/etc/nginx/nginx.conf"]
