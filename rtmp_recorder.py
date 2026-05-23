@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RTMP push-stream recorder wrapper around ffmpeg."""
+"""Record RTMP push streams with ffmpeg."""
 
 from __future__ import annotations
 
@@ -20,23 +20,36 @@ from pathlib import Path
 SHOULD_STOP = False
 
 
+def log(message: str, *, stderr: bool = False) -> None:
+    stream = sys.stderr if stderr else sys.stdout
+    print(f"[{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", file=stream, flush=True)
+
+
+def configure_output() -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
+
 def request_stop(signum: int, _frame: object) -> None:
     global SHOULD_STOP
     SHOULD_STOP = True
-    print(f"\n收到停止信号 {signum}，正在让 ffmpeg 收尾当前文件...", flush=True)
+    log(f"Received signal {signum}; stopping ffmpeg and finalizing the current file.")
 
 
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
-        raise argparse.ArgumentTypeError("必须是大于 0 的整数")
+        raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
 
 
 def non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
-        raise argparse.ArgumentTypeError("必须是大于等于 0 的整数")
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
     return parsed
 
 
@@ -195,65 +208,102 @@ def stop_ffmpeg(process: subprocess.Popen[bytes]) -> None:
     process.kill()
 
 
-def output_started(out_dir: Path, prefix: str, ext: str, started_at: float) -> bool:
+def recent_output_file(out_dir: Path, prefix: str, ext: str, started_at: float) -> Path | None:
+    candidates: list[Path] = []
     for candidate in out_dir.glob(f"{prefix}_*.{ext}"):
         try:
             if candidate.stat().st_mtime >= started_at - 1:
-                return True
+                candidates.append(candidate)
         except OSError:
             continue
-    return False
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def format_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
 
 
 def print_push_addresses(args: argparse.Namespace) -> None:
     ips = [args.public_host] if args.public_host else local_ipv4_addresses()
-    print("在推流设备或直播软件里填写：")
+    log("Use one of these RTMP addresses in your camera, phone app, OBS, or encoder:")
     if ips:
         for ip in ips:
             full = rtmp_public_url(ip, args.port, args.app, args.stream_key)
             server = f"rtmp://{ip}:{args.port}/{args.app.strip('/')}"
-            print(f"  完整 RTMP 地址：{full}")
-            print(f"  如果分开填写：服务器 {server}，推流码 {args.stream_key}")
+            log(f"  Full URL: {full}")
+            log(f"  Split fields: server={server}, stream-key={args.stream_key}")
     else:
-        print("  没有自动识别到局域网 IP。请用 ipconfig 查看电脑 IPv4 地址。")
-        print(
-            "  格式："
-            f"rtmp://电脑IPv4:{args.port}/{args.app.strip('/')}/{args.stream_key.strip('/')}"
-        )
-    print()
-    print("推流设备和这台电脑必须网络互通。Windows 防火墙弹窗时请选择允许专用网络。")
+        log("  No local IPv4 address was detected. Set --public-host or PUBLIC_HOST.")
+        log(f"  Format: rtmp://HOST:{args.port}/{args.app.strip('/')}/{args.stream_key.strip('/')}")
+    log("The pushing device must be able to reach this host and TCP port.")
 
 
 def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
     command = ffmpeg_command(args, output_path)
-    print("启动 RTMP 接收录制：")
-    print(" ".join(f'"{part}"' if " " in part else part for part in command))
-    print(f"日志文件：{log_file}")
-    print("等待推流连接...")
+    output_dir = Path(args.output).resolve()
+    log("Starting RTMP recorder.")
+    log("Command: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+    log(f"ffmpeg log file: {log_file}")
+    log("Waiting for an RTMP publisher to connect...")
 
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    with log_file.open("ab") as log:
-        log.write(("\n\n=== start " + dt.datetime.now().isoformat(timespec="seconds") + " ===\n").encode())
+    with log_file.open("ab") as ffmpeg_log:
+        ffmpeg_log.write(("\n\n=== start " + dt.datetime.now().isoformat(timespec="seconds") + " ===\n").encode())
+        ffmpeg_log.flush()
         started_at = time.time()
+        last_status_at = 0.0
+        last_file: Path | None = None
+        last_size: int | None = None
         process = subprocess.Popen(
             command,
-            stdout=log,
+            stdout=ffmpeg_log,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
+        log(f"ffmpeg started with PID {process.pid}.")
         try:
             while process.poll() is None:
+                now = time.time()
                 if SHOULD_STOP:
                     stop_ffmpeg(process)
                     break
-                if (
-                    args.wait_timeout
-                    and time.time() - started_at > args.wait_timeout
-                    and not output_started(Path(args.output).resolve(), args.prefix, args.ext, started_at)
-                ):
-                    print(f"{args.wait_timeout} 秒内没有收到推流，终止本次等待。")
+
+                current_file = recent_output_file(output_dir, args.prefix, args.ext, started_at)
+                if current_file and current_file != last_file:
+                    last_file = current_file
+                    log(f"Recording file opened: {current_file}")
+
+                if now - last_status_at >= args.status_interval:
+                    elapsed = int(now - started_at)
+                    if current_file and current_file.exists():
+                        size = current_file.stat().st_size
+                        if last_size is None:
+                            delta = size
+                        else:
+                            delta = max(0, size - last_size)
+                        last_size = size
+                        log(
+                            "Status: recording, "
+                            f"elapsed={elapsed}s, file={current_file.name}, "
+                            f"size={format_size(size)}, delta={format_size(delta)}"
+                        )
+                    else:
+                        log(f"Status: waiting for stream, elapsed={elapsed}s")
+                    last_status_at = now
+
+                if args.wait_timeout and now - started_at > args.wait_timeout and current_file is None:
+                    log(f"No RTMP stream arrived within {args.wait_timeout}s; stopping this attempt.")
                     stop_ffmpeg(process)
                     return 124
+
                 time.sleep(0.5)
         finally:
             if SHOULD_STOP:
@@ -264,37 +314,38 @@ def run_once(args: argparse.Namespace, output_path: str, log_file: Path) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="开启本机 RTMP 接收地址，录制摄像机、手机、OBS 等设备或软件推过来的视频流。"
+        description="Listen for an RTMP push stream and record it with ffmpeg."
     )
-    parser.add_argument("--bind", default="0.0.0.0", help="监听地址，默认 0.0.0.0")
+    parser.add_argument("--bind", default="0.0.0.0", help="listen address, default: 0.0.0.0")
     parser.add_argument(
         "--public-host",
         default=os.environ.get("PUBLIC_HOST", ""),
-        help="展示给推流端填写的主机名或 IP；Docker 运行时建议设置为电脑局域网 IP",
+        help="host/IP shown to publishers; set this to your server public IP in Docker",
     )
-    parser.add_argument("--port", type=positive_int, default=1935, help="RTMP 端口，默认 1935")
-    parser.add_argument("--app", default="live", help="RTMP app 路径，默认 live")
-    parser.add_argument("--stream-key", default="stream", help="推流码，默认 stream")
-    parser.add_argument("-o", "--output", default="recordings", help="输出目录，默认 recordings")
-    parser.add_argument("--prefix", default="recording", help="文件名前缀，默认 recording")
-    parser.add_argument("--ext", default="mp4", choices=["mp4", "mkv", "mov"], help="输出封装格式")
+    parser.add_argument("--port", type=positive_int, default=1935, help="RTMP port, default: 1935")
+    parser.add_argument("--app", default="live", help="RTMP app path, default: live")
+    parser.add_argument("--stream-key", default="stream", help="stream key, default: stream")
+    parser.add_argument("-o", "--output", default="recordings", help="output directory, default: recordings")
+    parser.add_argument("--prefix", default="recording", help="recording filename prefix, default: recording")
+    parser.add_argument("--ext", default="mp4", choices=["mp4", "mkv", "mov"], help="output container format")
     parser.add_argument(
         "--segment-time",
         type=non_negative_int,
         default=600,
-        help="切片秒数，默认 600；设为 0 表示录成单个文件",
+        help="segment length in seconds, default: 600; set to 0 for a single file",
     )
-    parser.add_argument("--duration", type=positive_int, help="收到推流后的总录制秒数；不填则一直录到 Ctrl+C")
-    parser.add_argument("--wait-timeout", type=non_negative_int, default=0, help="等待推流秒数；0 表示一直等待")
-    parser.add_argument("--max-retries", type=int, default=-1, help="异常退出最大重试次数；-1 表示无限重试")
-    parser.add_argument("--reconnect-delay", type=positive_int, default=5, help="断开后重试等待秒数")
-    parser.add_argument("--log-dir", default="logs", help="日志目录，默认 logs")
-    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg 可执行文件路径")
+    parser.add_argument("--duration", type=positive_int, help="total recording seconds after stream starts")
+    parser.add_argument("--wait-timeout", type=non_negative_int, default=0, help="stream wait timeout; 0 waits forever")
+    parser.add_argument("--max-retries", type=int, default=-1, help="max retries after failure; -1 retries forever")
+    parser.add_argument("--reconnect-delay", type=positive_int, default=5, help="seconds before retry")
+    parser.add_argument("--status-interval", type=positive_int, default=10, help="status log interval in seconds")
+    parser.add_argument("--log-dir", default="logs", help="ffmpeg log directory, default: logs")
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable path")
     parser.add_argument(
         "--loglevel",
         default="warning",
         choices=["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug"],
-        help="ffmpeg 日志等级",
+        help="ffmpeg log level",
     )
     args = parser.parse_args(argv)
 
@@ -304,13 +355,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    configure_output()
     signal.signal(signal.SIGINT, request_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, request_stop)
 
     args = parse_args(argv)
     if shutil.which(args.ffmpeg) is None and not Path(args.ffmpeg).exists():
-        print("找不到 ffmpeg。请先安装 ffmpeg，或用 --ffmpeg 指定 ffmpeg.exe 路径。", file=sys.stderr)
+        log("ffmpeg was not found. Install ffmpeg or set --ffmpeg.", stderr=True)
         return 2
 
     output_dir = Path(args.output).resolve()
@@ -321,8 +373,9 @@ def main(argv: list[str]) -> int:
     args.log_dir = str(log_dir)
 
     print_push_addresses(args)
-    print(f"输出目录：{output_dir}")
-    print("按 Ctrl+C 停止录制。")
+    log(f"Output directory: {output_dir}")
+    log(f"ffmpeg log directory: {log_dir}")
+    log("Press Ctrl+C to stop and finalize the current recording.")
 
     retries = 0
     while not SHOULD_STOP:
@@ -335,24 +388,24 @@ def main(argv: list[str]) -> int:
         exit_code = run_once(args, output_path, log_file)
 
         if SHOULD_STOP:
-            print("录制已停止。")
+            log("Recorder stopped.")
             return 0
 
         if exit_code == 0:
-            print("ffmpeg 正常结束。")
+            log("ffmpeg exited normally.")
             return 0
 
         retries += 1
         if args.max_retries >= 0 and retries > args.max_retries:
-            print(
-                f"ffmpeg 异常退出，退出码 {display_exit_code(exit_code)}；已达到最大重试次数。",
-                file=sys.stderr,
+            log(
+                f"ffmpeg exited with code {display_exit_code(exit_code)}; max retries reached.",
+                stderr=True,
             )
             return exit_code
 
-        print(
-            f"ffmpeg 异常退出，退出码 {display_exit_code(exit_code)}；{args.reconnect_delay} 秒后重新等待推流"
-            f"（第 {retries} 次）。"
+        log(
+            f"ffmpeg exited with code {display_exit_code(exit_code)}; "
+            f"retrying in {args.reconnect_delay}s (attempt {retries})."
         )
         time.sleep(args.reconnect_delay)
 
