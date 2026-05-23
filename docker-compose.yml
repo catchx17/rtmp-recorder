@@ -1,0 +1,12 @@
+services:
+  rtmp-recorder:
+    image: ghcr.io/catchx17/rtmp-recorder:latest
+    container_name: rtmp-recorder
+    restart: unless-stopped
+    ports:
+      - "1935:1935"
+    environment:
+      PUBLIC_HOST: "${PUBLIC_HOST:-192.168.110.83}"
+    volumes:
+      - ./recordings:/app/recordings
+      - ./logs:/app/logs

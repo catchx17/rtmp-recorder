@@ -30,6 +30,34 @@ docker run --rm -it `
   rtmp-push-recorder
 ```
 
+## Docker Compose 运行
+
+如果使用 GitHub 已构建好的容器镜像，可以直接运行：
+
+```powershell
+cd C:\Users\masterke\Desktop\rtmp-recorder
+$env:PUBLIC_HOST="192.168.110.83"
+docker compose up -d
+```
+
+查看日志：
+
+```powershell
+docker compose logs -f
+```
+
+停止：
+
+```powershell
+docker compose down
+```
+
+Compose 默认使用镜像：
+
+```text
+ghcr.io/catchx17/rtmp-recorder:latest
+```
+
 把 `PUBLIC_HOST` 改成这台电脑在局域网里的 IPv4 地址。当前常见值是：
 
 ```text
