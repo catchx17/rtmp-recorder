@@ -1,0 +1,9 @@
+.git
+__pycache__/
+*.pyc
+build/
+dist/
+logs/
+recordings/
+*.spec
+.env
