@@ -127,3 +127,34 @@ rtmp://电脑IP:1935/live
 ```text
 stream
 ```
+
+## GitHub 容器镜像
+
+仓库会通过 GitHub Actions 构建镜像并推送到 GitHub Container Registry：
+
+```text
+ghcr.io/catchx17/rtmp-recorder:latest
+```
+
+拉取镜像：
+
+```powershell
+docker pull ghcr.io/catchx17/rtmp-recorder:latest
+```
+
+运行镜像：
+
+```powershell
+docker run --rm -it `
+  -p 1935:1935 `
+  -e PUBLIC_HOST=192.168.110.83 `
+  -v "${PWD}\recordings:/app/recordings" `
+  -v "${PWD}\logs:/app/logs" `
+  ghcr.io/catchx17/rtmp-recorder:latest
+```
+
+如果仓库保持私有，拉取镜像前需要登录 GHCR：
+
+```powershell
+echo YOUR_GITHUB_TOKEN | docker login ghcr.io -u catchx17 --password-stdin
+```
